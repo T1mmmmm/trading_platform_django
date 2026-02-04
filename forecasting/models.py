@@ -12,6 +12,8 @@ class ForecastJob(models.Model):
     """
     本节课最小模型：存 job 元数据 + 状态 + outputUri
     """
+    dedup_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+
     forecast_job_id = models.CharField(max_length=64, unique=True, db_index=True)
     tenant_id = models.CharField(max_length=64, db_index=True)
 

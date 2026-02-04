@@ -1,4 +1,6 @@
 from django.shortcuts import render
+from .dedup import file_checksum_sha256, normalize_params, build_dedup_key
+
 
 # Create your views here.
 import json
@@ -34,7 +36,7 @@ class ForecastListCreateView(APIView):
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
 
-        # 幂等：同 tenant + idemKey 返回同一个 job
+        # 1) 幂等：同 tenant + idemKey 返回同一个 job
         if idem_key:
             existing = ForecastJob.objects.filter(
                 tenant_id=tenant_id, idempotency_key=idem_key
@@ -43,13 +45,34 @@ class ForecastListCreateView(APIView):
                 out = {"forecastJobId": existing.forecast_job_id, "status": existing.status}
                 return Response(ForecastCreateResponseSerializer(out).data)
 
+        # 2) dedup：相同输入（dataChecksum|modelType|normalizedParams|horizon）复用 SUCCEEDED 结果
+        model_type = data["modelType"]
+        raw_params = data.get("params", {})
+        horizon = data["horizon"]
+
+        norm_params = normalize_params(model_type, raw_params)
+        checksum = file_checksum_sha256(norm_params["csvPath"]) if model_type == "MA" else "no_data"
+        dedup_key = build_dedup_key(checksum, model_type, norm_params, horizon)
+
+        existing_done = ForecastJob.objects.filter(
+            tenant_id=tenant_id,
+            dedup_key=dedup_key,
+            status=JobStatus.SUCCEEDED,
+        ).order_by("-finished_at").first()
+
+        if existing_done:
+            out = {"forecastJobId": existing_done.forecast_job_id, "status": existing_done.status}
+            return Response(ForecastCreateResponseSerializer(out).data)
+
+        # 3) create new job
         job = ForecastJob.objects.create(
             forecast_job_id=ForecastJob.new_job_id(),
             tenant_id=tenant_id,
             idempotency_key=idem_key,
-            model_type=data["modelType"],
-            params_json=data.get("params", {}),
-            horizon=data["horizon"],
+            dedup_key=dedup_key,
+            model_type=model_type,
+            params_json=norm_params,   # store normalized params
+            horizon=horizon,
             status=JobStatus.PENDING,
         )
 
