@@ -2,6 +2,7 @@ import json
 import random
 import time
 import csv
+import pandas as pd
 from typing import List, Tuple, Optional
 from datetime import timedelta
 from pathlib import Path
@@ -13,10 +14,26 @@ from django.utils import timezone
 
 from forecasting.models import ForecastJob, JobStatus
 
-MODEL_ARTIFACT_VERSION = "stub-model:v0.1"
+#MODEL_ARTIFACT_VERSION = "stub-model:v0.1"
 
 # Read from csv
-MODEL_ARTIFACT_VERSION = "ma-model:v0.1"
+#MODEL_ARTIFACT_VERSION = "ma-model:v0.1"
+
+MODEL_ARTIFACT_VERSION = "ma-baseline:v0.1"
+def write_ma_artifact(job_id: str, processed_path: Path, window: int, horizon: int) -> Path:
+    df = pd.read_csv(processed_path)
+    series = df["target"].dropna().tolist()
+    if len(series) < window:
+        raise ValueError(f"not enough data points: have={len(series)}, need window={window}")
+    ma = sum(series[-window:]) / window
+
+    start_date = timezone.now().date()
+    preds = [{"timestamp": (start_date + timedelta(days=i+1)).isoformat(), "yhat": round(float(ma), 4)} for i in range(horizon)]
+
+    payload = {"predictions": preds, "metrics": {"rmse": None}, "modelArtifactVersion": MODEL_ARTIFACT_VERSION}
+    out_path = processed_path.parent / f"{job_id}.json"
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
 
 def read_series_from_csv(csv_path: str, target_column: str = "Close") -> Tuple[List[str], List[float]]:
     """
@@ -162,13 +179,27 @@ class Command(BaseCommand):
                 # 模拟耗时计算
                 time.sleep(1.0)
 
-                artifact = write_artifact_for_job(job)
+                # ✅ new: MA from datasetVersion.processed.csv
+                if not job.dataset_version:
+                    raise ValueError("job missing dataset_version")
+                if not job.dataset_version.processed_uri:
+                    raise ValueError("datasetVersion missing processed_uri")
+
+                processed_path = Path(job.dataset_version.processed_uri)
+
+                window = int((job.params_json or {}).get("window", 20))
+                horizon = int(job.horizon)
+
+                artifact = write_ma_artifact(job.forecast_job_id, processed_path, window, horizon)
+
                 job.output_uri = str(artifact)
                 job.status = JobStatus.SUCCEEDED
                 job.finished_at = timezone.now()
                 job.save()
 
+
                 self.stdout.write(f"SUCCEEDED: {job.forecast_job_id}")
+
             except Exception as e:
                 job.status = JobStatus.FAILED
                 job.error_message = f"{type(e).__name__}: {e}"
