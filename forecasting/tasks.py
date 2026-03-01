@@ -106,4 +106,88 @@ def run_trade_sim(trade_sim_run_id):
         with open(sr.output_uri, "r", encoding="utf-8") as f:
             sig_data = json.load(f)
 
-        
+        df_hist = pd.read_csv(job.dataset_version.processed_uri)
+        if "timestamp" not in df_hist.columns:
+            raise ValueError("processed.csv missing 'timestamp' column")
+        price_col = "target" if "target" in df_hist.columns else "close"
+        if price_col not in df_hist.columns:
+            raise ValueError("processed.csv missing price column ('target' or 'close')")
+
+        cash = float(sa.initial_cash)
+        initial_cash = cash
+        shares = 0
+
+        orders = []
+        fills = []
+        equity_curve = []
+
+        for s in sig_data.get("signals", []):
+            ts = s.get("timestamp")
+            action = s.get("action")
+
+            price_row = df_hist[df_hist["timestamp"] == ts]
+            if price_row.empty:
+                continue
+
+            price = float(price_row.iloc[0][price_col])
+            if price <= 0:
+                continue
+
+            if action == "BUY" and cash >= price:
+                qty = int((cash * 0.2) // price)
+                if qty > 0:
+                    cash -= qty * price
+                    shares += qty
+                    orders.append({"timestamp": ts, "action": "BUY", "price": price, "qty": qty})
+                    fills.append({"timestamp": ts, "fill_price": price, "filled_qty": qty})
+
+            if action == "SELL" and shares > 0:
+                qty = shares
+                cash += qty * price
+                orders.append({"timestamp": ts, "action": "SELL", "price": price, "qty": qty})
+                fills.append({"timestamp": ts, "fill_price": price, "filled_qty": qty})
+                shares = 0
+
+            equity_curve.append({"timestamp": ts, "equity": cash + shares * price})
+
+        if not equity_curve:
+            equity_curve.append({"timestamp": None, "equity": initial_cash})
+
+        final_equity = float(equity_curve[-1]["equity"])
+        total_return = (final_equity / initial_cash) - 1
+
+        peak = float(equity_curve[0]["equity"])
+        max_drawdown = 0.0
+        for point in equity_curve:
+            eq = float(point["equity"])
+            if eq > peak:
+                peak = eq
+            dd = (eq / peak) - 1 if peak > 0 else 0.0
+            if dd < max_drawdown:
+                max_drawdown = dd
+
+        result = {
+            "orders": orders,
+            "fills": fills,
+            "equityCurve": equity_curve,
+            "metrics": {
+                "totalReturn": total_return,
+                "maxDrawdown": max_drawdown,
+            },
+        }
+
+        out_dir = Path(settings.ARTIFACT_DIR) / sim_run.tenant_id / "sim"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{sim_run.trade_sim_run_id}.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
+
+        sim_run.output_uri = str(out_path)
+        sim_run.result = result
+        sim_run.status = "SUCCEEDED"
+        sim_run.save(update_fields=["output_uri", "result", "status", "updated_at"])
+
+    except Exception:
+        sim_run.status = "FAILED"
+        sim_run.error_message = traceback.format_exc()
+        sim_run.save(update_fields=["status", "error_message", "updated_at"])
