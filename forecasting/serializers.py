@@ -1,5 +1,17 @@
 import json
 from rest_framework import serializers
+from .models import Strategy, SimAccount
+
+class StrategySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Strategy
+        fields = "__all__"
+        read_only_fields = ("tenant_id",)
+class SimAccountSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SimAccount
+        fields = "__all__"
+        read_only_fields = ("tenant_id",)
 
 # second HW
 class DatasetUploadSerializer(serializers.Serializer):
@@ -70,3 +82,40 @@ class ForecastResultSerializer(serializers.Serializer):
     predictions = serializers.ListField(child=serializers.DictField())
     metrics = serializers.DictField()
     modelArtifactVersion = serializers.CharField()
+
+
+class TradeSimRunCreateSerializer(serializers.Serializer):
+    account_id = serializers.CharField()
+    signal_run_id = serializers.CharField()
+    execution_model = serializers.CharField(required=False, default="NEXT_BAR_CLOSE")
+
+
+class TradeSimRunCreateResponseSerializer(serializers.Serializer):
+    tradeSimRunId = serializers.CharField()
+    status = serializers.CharField()
+
+
+class TradeSimRunSerializer(serializers.Serializer):
+    tradeSimRunId = serializers.CharField()
+    status = serializers.CharField()
+    executionModel = serializers.CharField()
+    createdAt = serializers.CharField()
+    outputUri = serializers.CharField(allow_null=True)
+    errorMessage = serializers.CharField(allow_null=True)
+
+
+class TradeSimResultSerializer(serializers.Serializer):
+    orders = serializers.ListField(child=serializers.DictField())
+    fills = serializers.ListField(child=serializers.DictField())
+    equityCurve = serializers.ListField(child=serializers.DictField())
+    metrics = serializers.DictField()
+
+
+class SignalRunSerializer(serializers.Serializer):
+    signalRunId = serializers.CharField()
+    status = serializers.CharField()
+    forecastJobId = serializers.CharField()
+    strategyId = serializers.CharField()
+    createdAt = serializers.CharField()
+    outputUri = serializers.CharField(allow_null=True)
+    errorMessage = serializers.CharField(allow_null=True)

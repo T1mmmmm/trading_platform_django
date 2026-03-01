@@ -1,6 +1,50 @@
 # Create your models here.
 from django.db import models
 import uuid
+from django.db.models import JSONField
+
+class TimestampedModel(models.Model):
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+class Strategy(TimestampedModel):
+    strategy_id = models.CharField(max_length=64, unique=True, default=uuid.uuid4)
+    tenant_id = models.CharField(max_length=64)
+    name = models.CharField(max_length=128)
+    type = models.CharField(max_length=32)
+    spec_json = JSONField(default=dict)
+
+    def __str__(self):
+        return self.name
+
+class SignalRun(TimestampedModel):
+    signal_run_id = models.CharField(max_length=64, unique=True, default=uuid.uuid4)
+    tenant_id = models.CharField(max_length=64)
+    forecast_job_id = models.CharField(max_length=128)
+    strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
+    status = models.CharField(max_length=32, default="PENDING")
+    output_uri = models.CharField(max_length=512, blank=True, null=True)
+    error_message = models.TextField(blank=True, null=True)
+
+class SimAccount(TimestampedModel):
+    account_id = models.CharField(max_length=64, unique=True, default=uuid.uuid4)
+    tenant_id = models.CharField(max_length=64)
+    base_currency = models.CharField(max_length=16, default="USD")
+    initial_cash = models.DecimalField(max_digits=20, decimal_places=2)
+
+class TradeSimRun(TimestampedModel):
+    trade_sim_run_id = models.CharField(max_length=64, unique=True, default=uuid.uuid4)
+    tenant_id = models.CharField(max_length=64)
+    account = models.ForeignKey(SimAccount, on_delete=models.CASCADE)
+    signal_run = models.ForeignKey(SignalRun, on_delete=models.CASCADE)
+    execution_model = models.CharField(max_length=32, default="NEXT_BAR_CLOSE")
+    status = models.CharField(max_length=32, default="PENDING")
+    output_uri = models.CharField(max_length=512, blank=True, null=True)
+    error_message = models.TextField(blank=True, null=True)
+    result = JSONField(blank=True, null=True)
 
 class JobStatus(models.TextChoices):
     PENDING = "PENDING"

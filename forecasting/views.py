@@ -13,8 +13,11 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework import viewsets
 
-from .models import Dataset, DatasetVersion, DatasetVersionStatus, ForecastJob, JobStatus
+
+from .models import Dataset, DatasetVersion, DatasetVersionStatus, ForecastJob, JobStatus, Strategy, SimAccount, SignalRun, TradeSimRun
+from .tasks import run_signal_job, run_trade_sim
 from .serializers import (
     DatasetCreateSerializer, DatasetCreateResponseSerializer,
     DatasetCommitSerializer, DatasetCommitResponseSerializer,
@@ -24,7 +27,232 @@ from .serializers import (
     ForecastCreateResponseSerializer,
     ForecastJobSerializer,
     ForecastResultSerializer,
+    SignalRunSerializer,
+    TradeSimRunCreateSerializer,
+    TradeSimRunCreateResponseSerializer,
+    TradeSimRunSerializer,
+    TradeSimResultSerializer,
+    StrategySerializer,
+    SimAccountSerializer,
 )
+class SignalRunStartView(APIView):
+    def post(self, request):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        forecast_job_id = request.data.get("forecast_job_id")
+        strategy_id = request.data.get("strategy_id")
+
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not forecast_job_id or not strategy_id:
+            return Response(
+                {"detail": "forecast_job_id and strategy_id are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # validate strategy exists
+        try:
+            strategy = Strategy.objects.get(strategy_id=strategy_id, tenant_id=tenant_id)
+        except Strategy.DoesNotExist:
+            return Response({"detail": "Strategy not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # validate forecast job exists (adjust field name to your model)
+        try:
+            ForecastJob.objects.get(forecast_job_id=forecast_job_id, tenant_id=tenant_id)
+        except ForecastJob.DoesNotExist:
+            return Response({"detail": "ForecastJob not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        sr = SignalRun.objects.create(
+            tenant_id=tenant_id,
+            forecast_job_id=forecast_job_id,
+            strategy=strategy,
+            status="PENDING",
+        )
+        # enqueue async job
+        try:
+            run_signal_job.delay(sr.signal_run_id)
+        except Exception:
+            # Broker may be unavailable in local dev; keep PENDING for polling worker.
+            pass
+
+        return Response(
+            {"signalRunId": sr.signal_run_id, "status": sr.status},
+            status=status.HTTP_201_CREATED
+        )
+
+
+class SignalRunDetailView(APIView):
+    def get(self, request, signal_run_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        sr = SignalRun.objects.filter(
+            tenant_id=tenant_id,
+            signal_run_id=signal_run_id,
+        ).first()
+        if not sr:
+            return Response({"detail": "SignalRun not found"}, status=404)
+
+        out = {
+            "signalRunId": sr.signal_run_id,
+            "status": sr.status,
+            "forecastJobId": sr.forecast_job_id,
+            "strategyId": sr.strategy.strategy_id,
+            "createdAt": sr.created_at.isoformat(),
+            "outputUri": sr.output_uri,
+            "errorMessage": sr.error_message,
+        }
+        return Response(SignalRunSerializer(out).data, status=200)
+
+
+class SignalRunResultView(APIView):
+    def get(self, request, signal_run_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        sr = SignalRun.objects.filter(
+            tenant_id=tenant_id,
+            signal_run_id=signal_run_id,
+        ).first()
+        if not sr:
+            return Response({"detail": "SignalRun not found"}, status=404)
+        if sr.status != "SUCCEEDED":
+            return Response(
+                {"detail": f"SignalRun not ready, status={sr.status}"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if not sr.output_uri:
+            return Response({"detail": "Missing signal output_uri"}, status=500)
+
+        try:
+            with open(sr.output_uri, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            return Response({"detail": f"Failed to load artifact: {e}"}, status=500)
+
+        return Response(payload, status=200)
+
+
+class SimAccountViewSet(viewsets.ModelViewSet):
+    serializer_class = SimAccountSerializer
+
+    def get_queryset(self):
+        return SimAccount.objects.filter(tenant_id=self.request.user.tenant_id)
+
+    def perform_create(self, serializer):
+        serializer.save(tenant_id=self.request.user.tenant_id)
+
+class StrategyViewSet(viewsets.ModelViewSet):
+    serializer_class = StrategySerializer
+
+    def get_queryset(self):
+        return Strategy.objects.filter(tenant_id=self.request.user.tenant_id)
+
+    def perform_create(self, serializer):
+        serializer.save(tenant_id=self.request.user.tenant_id)
+
+
+class TradeSimRunCreateView(APIView):
+    def post(self, request):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        ser = TradeSimRunCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        account = SimAccount.objects.filter(
+            tenant_id=tenant_id,
+            account_id=data["account_id"],
+        ).first()
+        if not account:
+            return Response({"detail": "SimAccount not found"}, status=404)
+
+        signal_run = SignalRun.objects.filter(
+            tenant_id=tenant_id,
+            signal_run_id=data["signal_run_id"],
+        ).first()
+        if not signal_run:
+            return Response({"detail": "SignalRun not found"}, status=404)
+        if signal_run.status != "SUCCEEDED":
+            return Response(
+                {"detail": f"SignalRun not ready, status={signal_run.status}"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        sim_run = TradeSimRun.objects.create(
+            tenant_id=tenant_id,
+            account=account,
+            signal_run=signal_run,
+            execution_model=data.get("execution_model", "NEXT_BAR_CLOSE"),
+            status="PENDING",
+        )
+
+        try:
+            run_trade_sim.delay(sim_run.trade_sim_run_id)
+        except Exception:
+            # Broker may be unavailable in local dev; keep PENDING for polling worker.
+            pass
+
+        return Response(
+            TradeSimRunCreateResponseSerializer(
+                {"tradeSimRunId": sim_run.trade_sim_run_id, "status": sim_run.status}
+            ).data,
+            status=201,
+        )
+
+
+class TradeSimRunDetailView(APIView):
+    def get(self, request, trade_sim_run_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        sim_run = TradeSimRun.objects.filter(
+            tenant_id=tenant_id,
+            trade_sim_run_id=trade_sim_run_id,
+        ).first()
+        if not sim_run:
+            return Response({"detail": "TradeSimRun not found"}, status=404)
+
+        out = {
+            "tradeSimRunId": sim_run.trade_sim_run_id,
+            "status": sim_run.status,
+            "executionModel": sim_run.execution_model,
+            "createdAt": sim_run.created_at.isoformat(),
+            "outputUri": sim_run.output_uri,
+            "errorMessage": sim_run.error_message,
+        }
+        return Response(TradeSimRunSerializer(out).data, status=200)
+
+
+class TradeSimRunResultView(APIView):
+    def get(self, request, trade_sim_run_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        sim_run = TradeSimRun.objects.filter(
+            tenant_id=tenant_id,
+            trade_sim_run_id=trade_sim_run_id,
+        ).first()
+        if not sim_run:
+            return Response({"detail": "TradeSimRun not found"}, status=404)
+        if sim_run.status != "SUCCEEDED":
+            return Response(
+                {"detail": f"TradeSimRun not ready, status={sim_run.status}"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        payload = sim_run.result
+        if not payload and sim_run.output_uri:
+            try:
+                with open(sim_run.output_uri, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception as e:
+                return Response({"detail": f"Failed to load artifact: {e}"}, status=500)
+
+        if not payload:
+            return Response({"detail": "Missing simulation result"}, status=500)
+
+        return Response(TradeSimResultSerializer(payload).data, status=200)
 
 # HW2:
 class DatasetUploadView(APIView):
@@ -104,142 +332,4 @@ class DatasetCommitView(APIView):
 
         raw_src = (settings.BASE_DIR / local_path).resolve()
         if not raw_src.exists():
-            return Response({"detail": f"localPath not found: {local_path}"}, status=400)
-
-        dsv_id = DatasetVersion.new_dataset_version_id()
-
-        tenant_dir = settings.ARTIFACT_DIR / tenant_id / "datasets" / dsv_id
-        tenant_dir.mkdir(parents=True, exist_ok=True)
-
-        raw_uri = tenant_dir / "raw.csv"
-        raw_uri.write_bytes(raw_src.read_bytes())
-
-        dsv = DatasetVersion.objects.create(
-            dataset_version_id=dsv_id,
-            dataset=ds,
-            tenant_id=tenant_id,
-            raw_uri=str(raw_uri),
-            schema_json={
-                "timestamp": mapping.get("timestamp"),
-                "target": mapping.get("target"),
-            },
-            status=DatasetVersionStatus.VALIDATING,
-        )
-
-        return Response(
-            DatasetCommitResponseSerializer({"datasetVersionId": dsv.dataset_version_id, "status": dsv.status}).data,
-            status=201
-        )
-
-class DatasetVersionDetailView(APIView):
-    def get(self, request, dataset_id: str, dataset_version_id: str):
-        tenant_id = request.user.tenant_id
-        dsv = DatasetVersion.objects.filter(
-            tenant_id=tenant_id,
-            dataset__dataset_id=dataset_id,
-            dataset_version_id=dataset_version_id
-        ).first()
-        if not dsv:
-            return Response({"detail": "DatasetVersion not found"}, status=404)
-
-        out = {
-            "datasetVersionId": dsv.dataset_version_id,
-            "status": dsv.status,
-            "checksum": dsv.checksum,
-            "schema": dsv.schema_json,
-            "profile": dsv.profile_json or {},
-            "rawUri": dsv.raw_uri,
-            "processedUri": dsv.processed_uri,
-            "errorMessage": dsv.error_message,
-        }
-        return Response(DatasetVersionSerializer(out).data, status=200)
-class HealthView(APIView):
-    authentication_classes = []
-    permission_classes = []
-
-    def get(self, request):
-        return Response({"status": "ok"})
-
-class ForecastListCreateView(APIView):
-    def post(self, request):
-        tenant_id = request.user.tenant_id
-        idem_key = request.headers.get("X-Idempotency-Key")
-
-        ser = ForecastCreateSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        data = ser.validated_data
-
-        dsv = DatasetVersion.objects.filter(
-            tenant_id=tenant_id,
-            dataset_version_id=data["datasetVersionId"]
-        ).first()
-        if not dsv:
-            return Response({"detail": "DatasetVersion not found"}, status=404)
-        if dsv.status != DatasetVersionStatus.READY:
-            return Response({"detail": f"DatasetVersion not READY, status={dsv.status}"}, status=409)
-
-        if idem_key:
-            existing = ForecastJob.objects.filter(tenant_id=tenant_id, idempotency_key=idem_key).first()
-            if existing:
-                return Response({"forecastJobId": existing.forecast_job_id, "status": existing.status}, status=200)
-
-        job = ForecastJob.objects.create(
-            forecast_job_id=ForecastJob.new_job_id(),
-            tenant_id=tenant_id,
-            dataset_version=dsv,
-            idempotency_key=idem_key,
-            model_type=data["modelType"],
-            params_json=data.get("params", {}),
-            horizon=data["horizon"],
-            status=JobStatus.PENDING,
-        )
-        return Response({"forecastJobId": job.forecast_job_id, "status": job.status}, status=201)
-
-class ForecastDetailView(APIView):
-    """
-    GET /api/v1/forecasts/{jobId}/
-    """
-    def get(self, request, job_id: str):
-        tenant_id = request.user.tenant_id
-        job = ForecastJob.objects.filter(tenant_id=tenant_id, forecast_job_id=job_id).first()
-        if not job:
-            return Response({"detail": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        out = {
-            "forecastJobId": job.forecast_job_id,
-            "status": job.status,
-            "modelType": job.model_type,
-            "horizon": job.horizon,
-            "createdAt": job.created_at.isoformat(),
-            "startedAt": job.started_at.isoformat() if job.started_at else None,
-            "finishedAt": job.finished_at.isoformat() if job.finished_at else None,
-            "outputUri": job.output_uri,
-            "errorMessage": job.error_message,
-        }
-        return Response(ForecastJobSerializer(out).data)
-
-class ForecastResultView(APIView):
-    """
-    GET /api/v1/forecasts/{jobId}/result/
-    """
-    def get(self, request, job_id: str):
-        tenant_id = request.user.tenant_id
-        job = ForecastJob.objects.filter(tenant_id=tenant_id, forecast_job_id=job_id).first()
-        if not job:
-            return Response({"detail": "Job not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        if job.status != JobStatus.SUCCEEDED:
-            return Response(
-                {"detail": f"Job not ready, status={job.status}"},
-                status=status.HTTP_409_CONFLICT
-            )
-
-        if not job.output_uri:
-            return Response({"detail": "Missing outputUri"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        try:
-            with open(job.output_uri, "r", encoding="utf-8") as f:
-                payload = json.loads(f.read())
-            return Response(ForecastResultSerializer(payload).data)
-        except Exception as e:
-            return Response({"detail": f"Failed to load artifact: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+          
