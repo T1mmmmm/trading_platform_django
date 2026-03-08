@@ -3,6 +3,68 @@ from django.db import models
 import uuid
 from django.db.models import JSONField
 
+
+class BacktestStatus(models.TextChoices):
+    CREATED = "CREATED"
+    FORECAST_PENDING = "FORECAST_PENDING"
+    FORECAST_DONE = "FORECAST_DONE"
+    SIGNAL_PENDING = "SIGNAL_PENDING"
+    SIGNAL_DONE = "SIGNAL_DONE"
+    SIM_PENDING = "SIM_PENDING"
+    SIM_DONE = "SIM_DONE"
+    METRICS_DONE = "METRICS_DONE"
+    REPORT_DONE = "REPORT_DONE"
+    FAILED = "FAILED"
+
+class BacktestRun(models.Model):
+    backtest_run_id = models.CharField(max_length=64, unique=True, db_index=True)
+    tenant_id = models.CharField(max_length=64, db_index=True)
+
+    dataset_version = models.ForeignKey("DatasetVersion", on_delete=models.PROTECT)
+    strategy = models.ForeignKey("Strategy", on_delete=models.PROTECT)
+
+    forecast_config_snapshot_json = models.JSONField(default=dict)
+    account_config_json = models.JSONField(default=dict)
+    execution_config_json = models.JSONField(default=dict)
+    risk_rules_json = models.JSONField(default=dict)
+
+    status = models.CharField(max_length=32, choices=BacktestStatus.choices, default=BacktestStatus.CREATED)
+
+    forecast_job_id = models.CharField(max_length=64, null=True, blank=True)
+    signal_run_id = models.CharField(max_length=64, null=True, blank=True)
+    trade_sim_run_id = models.CharField(max_length=64, null=True, blank=True)
+
+    metrics_json = models.JSONField(default=dict)
+    output_uri = models.TextField(null=True, blank=True)
+    report_uri = models.TextField(null=True, blank=True)
+
+    retry_count = models.IntegerField(default=0)
+    last_error = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    @staticmethod
+    def new_backtest_run_id() -> str:
+        return f"bt_{uuid.uuid4().hex[:12]}"
+
+class Report(models.Model):
+    report_id = models.CharField(max_length=64, unique=True, db_index=True)
+    tenant_id = models.CharField(max_length=64, db_index=True)
+
+    source_type = models.CharField(max_length=32)
+    source_id = models.CharField(max_length=64)
+    format = models.CharField(max_length=32, default="MARKDOWN")
+    uri = models.TextField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    @staticmethod
+    def new_report_id() -> str:
+        return f"rp_{uuid.uuid4().hex[:12]}"
+    
+    
 class TimestampedModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

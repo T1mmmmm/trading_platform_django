@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import SignalRunStartView, SignalRunDetailView, SignalRunResultView, TradeSimRunCreateView, TradeSimRunDetailView, TradeSimRunResultView, DatasetCreateView, DatasetCommitView, DatasetVersionDetailView, DatasetUploadView, HealthView, ForecastListCreateView, ForecastDetailView, ForecastResultView, SimAccountViewSet, StrategyViewSet
+from .views import SignalRunStartView, SignalRunDetailView, SignalRunResultView, TradeSimRunCreateView, TradeSimRunDetailView, TradeSimRunResultView, DatasetCreateView, DatasetCommitView, DatasetVersionDetailView, DatasetUploadView, HealthView, ForecastListCreateView, ForecastDetailView, ForecastResultView, SimAccountViewSet, StrategyViewSet, BacktestCreateView, BacktestDetailView, BacktestResultView, ReportCreateView, ReportDetailView
 
 
 router = DefaultRouter()
@@ -25,4 +25,10 @@ urlpatterns = [
     path("forecasts/<str:job_id>/", ForecastDetailView.as_view()),
     path("forecasts/<str:job_id>/result/", ForecastResultView.as_view()),
     path('', include(router.urls)),
+
+    path("backtests/", BacktestCreateView.as_view()),
+    path("backtests/<str:backtest_run_id>/", BacktestDetailView.as_view()),
+    path("backtests/<str:backtest_run_id>/result", BacktestResultView.as_view()),
+    path("reports/", ReportCreateView.as_view()),
+    path("reports/<str:report_id>/", ReportDetailView.as_view()),
 ]

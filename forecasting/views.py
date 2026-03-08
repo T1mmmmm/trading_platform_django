@@ -16,7 +16,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework import viewsets
 
 
-from .models import Dataset, DatasetVersion, DatasetVersionStatus, ForecastJob, JobStatus, Strategy, SimAccount, SignalRun, TradeSimRun
+from .models import Dataset, DatasetVersion, DatasetVersionStatus, ForecastJob, JobStatus, Strategy, SimAccount, SignalRun, TradeSimRun, BacktestRun, BacktestStatus, Report
 from .tasks import run_signal_job, run_trade_sim
 from .serializers import (
     DatasetCreateSerializer, DatasetCreateResponseSerializer,
@@ -34,7 +34,246 @@ from .serializers import (
     TradeSimResultSerializer,
     StrategySerializer,
     SimAccountSerializer,
+    BacktestCreateSerializer,
+    BacktestCreateResponseSerializer,
+    BacktestDetailSerializer,
+    ReportCreateSerializer,
+    ReportSerializer,
 )
+
+class BacktestResultView(APIView):
+    def get(self, request, backtest_run_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        bt = BacktestRun.objects.filter(
+            tenant_id=tenant_id,
+            backtest_run_id=backtest_run_id,
+        ).first()
+        if not bt:
+            return Response({"detail": "BacktestRun not found"}, status=404)
+
+        if bt.status not in ["METRICS_DONE", "REPORT_DONE"]:
+            return Response(
+                {"detail": f"Backtest not ready, status={bt.status}"},
+                status=409
+            )
+
+        if not bt.output_uri:
+            return Response({"detail": "Missing output_uri"}, status=500)
+
+        payload = json.loads(Path(bt.output_uri).read_text(encoding="utf-8"))
+        return Response(payload, status=200)
+    
+class BacktestCreateView(APIView):
+    def post(self, request):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        ser = BacktestCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        dsv = DatasetVersion.objects.filter(
+            tenant_id=tenant_id,
+            dataset_version_id=data["datasetVersionId"],
+            status="READY",
+        ).first()
+        if not dsv:
+            return Response({"detail": "DatasetVersion not found or not READY"}, status=404)
+
+        strategy = Strategy.objects.filter(
+            tenant_id=tenant_id,
+            strategy_id=data["strategyId"],
+        ).first()
+        if not strategy:
+            return Response({"detail": "Strategy not found"}, status=404)
+
+        bt = BacktestRun.objects.create(
+            backtest_run_id=BacktestRun.new_backtest_run_id(),
+            tenant_id=tenant_id,
+            dataset_version=dsv,
+            strategy=strategy,
+            forecast_config_snapshot_json=data["forecast"],
+            account_config_json=data["account"],
+            execution_config_json=data.get("execution", {}),
+            risk_rules_json=data.get("riskRules", {}),
+            status=BacktestStatus.CREATED,
+        )
+
+        return Response(
+            BacktestCreateResponseSerializer({
+                "backtestRunId": bt.backtest_run_id,
+                "status": bt.status,
+            }).data,
+            status=status.HTTP_201_CREATED
+        )
+
+class BacktestDetailView(APIView):
+    def get(self, request, backtest_run_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        bt = BacktestRun.objects.filter(
+            tenant_id=tenant_id,
+            backtest_run_id=backtest_run_id,
+        ).first()
+        if not bt:
+            return Response({"detail": "BacktestRun not found"}, status=404)
+
+        out = {
+            "backtestRunId": bt.backtest_run_id,
+            "status": bt.status,
+            "datasetVersionId": bt.dataset_version.dataset_version_id,
+            "forecastJobId": bt.forecast_job_id,
+            "signalRunId": bt.signal_run_id,
+            "tradeSimRunId": bt.trade_sim_run_id,
+            "metrics": bt.metrics_json or {},
+            "reportUri": bt.report_uri,
+            "lastError": bt.last_error,
+        }
+        return Response(BacktestDetailSerializer(out).data, status=200)
+
+
+def _build_backtest_report_markdown(bt: BacktestRun, metrics: dict) -> str:
+    return f"""# Backtest Report
+
+## Run Summary
+- BacktestRunId: {bt.backtest_run_id}
+- DatasetVersionId: {bt.dataset_version.dataset_version_id}
+- StrategyId: {bt.strategy.strategy_id}
+- Forecast Config: {bt.forecast_config_snapshot_json}
+- Account Config: {bt.account_config_json}
+- Execution Config: {bt.execution_config_json}
+
+## Metrics
+- totalReturn: {metrics.get("totalReturn")}
+- maxDrawdown: {metrics.get("maxDrawdown")}
+
+## Interpretation
+- This is a template-generated report for this lesson.
+- Next step: replace this section with richer analysis/LLM output.
+"""
+
+
+class ReportCreateView(APIView):
+    def post(self, request):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        ser = ReportCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        source_type = data["sourceType"]
+        source_id = data["sourceId"]
+        fmt = data.get("format", "MARKDOWN")
+
+        if source_type != "BACKTEST":
+            return Response({"detail": "Only sourceType=BACKTEST is supported"}, status=400)
+
+        bt = BacktestRun.objects.filter(
+            tenant_id=tenant_id,
+            backtest_run_id=source_id,
+        ).first()
+        if not bt:
+            return Response({"detail": "BacktestRun not found"}, status=404)
+
+        metrics = bt.metrics_json or {}
+        if not metrics and bt.output_uri:
+            try:
+                payload = json.loads(Path(bt.output_uri).read_text(encoding="utf-8"))
+                metrics = payload.get("metrics", {})
+            except Exception:
+                metrics = {}
+
+        reports_dir = Path(settings.ARTIFACT_DIR) / tenant_id / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+
+        if fmt == "MARKDOWN":
+            report_path = reports_dir / f"{bt.backtest_run_id}.md"
+            report_path.write_text(
+                _build_backtest_report_markdown(bt, metrics),
+                encoding="utf-8",
+            )
+        elif fmt == "JSON":
+            report_path = reports_dir / f"{bt.backtest_run_id}.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "backtestRunId": bt.backtest_run_id,
+                        "datasetVersionId": bt.dataset_version.dataset_version_id,
+                        "strategyId": bt.strategy.strategy_id,
+                        "metrics": metrics,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        else:
+            return Response({"detail": "Unsupported report format"}, status=400)
+
+        report = Report.objects.create(
+            report_id=Report.new_report_id(),
+            tenant_id=tenant_id,
+            source_type=source_type,
+            source_id=source_id,
+            format=fmt,
+            uri=str(report_path),
+        )
+
+        if fmt == "MARKDOWN":
+            bt.report_uri = str(report_path)
+            bt.save(update_fields=["report_uri"])
+
+        out = {
+            "reportId": report.report_id,
+            "sourceType": report.source_type,
+            "sourceId": report.source_id,
+            "format": report.format,
+            "uri": report.uri,
+        }
+        return Response(ReportSerializer(out).data, status=201)
+
+
+class ReportDetailView(APIView):
+    def get(self, request, report_id: str):
+        tenant_id = getattr(request.user, "tenant_id", None)
+        if not tenant_id:
+            return Response(
+                {"detail": "Authenticated user with tenant_id is required"},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        report = Report.objects.filter(
+            tenant_id=tenant_id,
+            report_id=report_id,
+        ).first()
+        if not report:
+            return Response({"detail": "Report not found"}, status=404)
+
+        out = {
+            "reportId": report.report_id,
+            "sourceType": report.source_type,
+            "sourceId": report.source_id,
+            "format": report.format,
+            "uri": report.uri,
+        }
+        return Response(ReportSerializer(out).data, status=200)
+
 class SignalRunStartView(APIView):
     def post(self, request):
         tenant_id = getattr(request.user, "tenant_id", None)
@@ -82,7 +321,6 @@ class SignalRunStartView(APIView):
             {"signalRunId": sr.signal_run_id, "status": sr.status},
             status=status.HTTP_201_CREATED
         )
-
 
 class SignalRunDetailView(APIView):
     def get(self, request, signal_run_id: str):

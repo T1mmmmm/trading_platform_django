@@ -2,6 +2,52 @@ import json
 from rest_framework import serializers
 from .models import Strategy, SimAccount
 
+class BacktestCreateSerializer(serializers.Serializer):
+    datasetVersionId = serializers.CharField()
+    forecast = serializers.DictField()
+    strategyId = serializers.CharField()
+    account = serializers.DictField()
+    execution = serializers.DictField(required=False)
+    riskRules = serializers.DictField(required=False)
+
+class BacktestCreateResponseSerializer(serializers.Serializer):
+    backtestRunId = serializers.CharField()
+    status = serializers.CharField()
+
+class BacktestDetailSerializer(serializers.Serializer):
+    backtestRunId = serializers.CharField()
+    status = serializers.CharField()
+    datasetVersionId = serializers.CharField()
+    forecastJobId = serializers.CharField(allow_null=True)
+    signalRunId = serializers.CharField(allow_null=True)
+    tradeSimRunId = serializers.CharField(allow_null=True)
+    metrics = serializers.DictField()
+    reportUri = serializers.CharField(allow_null=True)
+    lastError = serializers.CharField(allow_null=True)
+
+class BacktestResultSerializer(serializers.Serializer):
+    backtestRunId = serializers.CharField()
+    status = serializers.CharField()
+    forecastJobId = serializers.CharField(allow_null=True)
+    signalRunId = serializers.CharField(allow_null=True)
+    tradeSimRunId = serializers.CharField(allow_null=True)
+    metrics = serializers.DictField()
+    equityCurve = serializers.ListField(child=serializers.DictField())
+    reportUri = serializers.CharField(allow_null=True)
+
+class ReportCreateSerializer(serializers.Serializer):
+    sourceType = serializers.CharField()
+    sourceId = serializers.CharField()
+    format = serializers.CharField(default="MARKDOWN")
+
+class ReportSerializer(serializers.Serializer):
+    reportId = serializers.CharField()
+    sourceType = serializers.CharField()
+    sourceId = serializers.CharField()
+    format = serializers.CharField()
+    uri = serializers.CharField()
+
+
 class StrategySerializer(serializers.ModelSerializer):
     class Meta:
         model = Strategy
